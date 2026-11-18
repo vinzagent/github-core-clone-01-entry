@@ -1,49 +1,58 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
-//
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// app.ts — the HTTP dispatcher: one entry point that routes a request to the
+// REST v3 surface, the GraphQL endpoint, the MCP endpoint or the git
+// smart-HTTP surface, and turns whatever a surface throws into a JSON error
+// reply so a bad request can never take the server down.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { Forge } from './forge.ts';
+import { ApiError } from './ops.ts';
+import { handleRest } from './rest.ts';
+import { handleGraphQL } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
+import { handleGit } from './gitproto.ts';
+import { jsonReply, messageReply, type Reply, type ReqCtx } from './http.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+let requestCounter = 0;
 
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+/** A unique, deterministic request id for the X-GitHub-Request-Id header. */
+export function nextRequestId(): string {
+  requestCounter += 1;
+  return `vinz-${requestCounter.toString(36)}-${((requestCounter * 2654435761) % 0xffffffff).toString(16)}`;
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
+const GIT_PATH = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
+
+/** Route one request. Never throws: an internal error is a 500 JSON reply. */
+export function dispatch(forge: Forge, ctx: Omit<ReqCtx, 'forge'>): Reply {
+  const full: ReqCtx = { ...ctx, forge };
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
+    let reply: Reply;
+    if (full.path === '/healthz') {
+      reply = jsonReply(200, { ok: true });
+    } else if (full.path === '/api/v3' || full.path.startsWith('/api/v3/')) {
+      reply = handleRest(full);
+    } else if (full.path === '/api/graphql') {
+      reply = handleGraphQL(full);
+    } else if (full.path === '/mcp') {
+      reply = handleMcp(full);
+    } else {
+      const git = GIT_PATH.exec(full.path);
+      if (git) {
+        reply = handleGit(full, decodeURIComponent(git[1]!), decodeURIComponent(git[2]!), git[3]!);
+      } else {
+        reply = messageReply(404, 'Not Found');
+      }
+    }
+    if (full.path.startsWith('/api/')) {
+      reply = { ...reply, headers: { ...(reply.headers ?? {}), 'x-github-request-id': nextRequestId() } };
+    }
+    return reply;
+  } catch (err) {
+    if (err instanceof ApiError) return messageReply(err.status, err.message);
+    return messageReply(500, 'Internal Server Error');
   }
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
-export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
-
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
-
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
-  });
+/** A fresh forge instance (one per process). */
+export function createForge(): Forge {
+  return new Forge();
 }
