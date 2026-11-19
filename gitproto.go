@@ -6,11 +6,14 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const gitAgent = "vinz-forge/1.0"
@@ -335,6 +338,7 @@ func treeClosure(repo *RepoRec, commitOid string, into map[string]bool) {
 
 type fetchPlan struct {
 	send      []*GitObject
+	sendOids  []string
 	shallow   []string
 	unshallow []string
 	ack       string
@@ -342,7 +346,61 @@ type fetchPlan struct {
 }
 
 // planFetch decides what a fetch sends. depth is nil for a full fetch.
+// ---------------------------------------------------------------------------
+// fetch plan cache
+
+// A fetch plan is a pure function of the object graph below the
+// requested oids, and that graph is immutable: objects are
+// content-addressed and never change once stored. The only store event
+// that can change a plan is a NEW object arriving (the store's
+// generation), so plans are cached per (repo, generation, wants, haves,
+// shallow lines, depth) — the lists hashed in request order, since the
+// plan's ack choice and shallow-line order follow it. Repeated clones
+// of one repository reuse the first plan wholesale.
+var planCacheMu sync.RWMutex
+var planCache = make(map[string]fetchPlan)
+
+func planCacheKey(repo *RepoRec, wants, haves, shallowLines []string, depth *float64) string {
+	hash := sha1.New()
+	var numBuf [32]byte
+	hash.Write(strconv.AppendInt(numBuf[:0], int64(repo.ID), 10))
+	hash.Write([]byte{0})
+	hash.Write(strconv.AppendInt(numBuf[:0], repo.Store.gen, 10))
+	hash.Write([]byte{0})
+	if depth == nil {
+		hash.Write([]byte("full"))
+	} else {
+		hash.Write(strconv.AppendFloat(numBuf[:0], *depth, 'g', -1, 64))
+	}
+	for _, list := range [][]string{wants, haves, shallowLines} {
+		hash.Write([]byte{1})
+		for _, oid := range list {
+			hash.Write([]byte(oid))
+			hash.Write([]byte{0})
+		}
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
 func planFetch(repo *RepoRec, wants []string, haves []string, shallowLines []string, depth *float64) fetchPlan {
+	key := planCacheKey(repo, wants, haves, shallowLines, depth)
+	planCacheMu.RLock()
+	plan, ok := planCache[key]
+	planCacheMu.RUnlock()
+	if ok {
+		return plan
+	}
+	plan = planFetchUncached(repo, wants, haves, shallowLines, depth)
+	planCacheMu.Lock()
+	if len(planCache) >= 128 {
+		planCache = make(map[string]fetchPlan)
+	}
+	planCache[key] = plan
+	planCacheMu.Unlock()
+	return plan
+}
+
+func planFetchUncached(repo *RepoRec, wants []string, haves []string, shallowLines []string, depth *float64) fetchPlan {
 	store := repo.Store
 	shallowSet := make(map[string]bool)
 	for _, oid := range shallowLines {
@@ -459,12 +517,14 @@ func planFetch(repo *RepoRec, wants []string, haves []string, shallowLines []str
 		}
 	}
 	send := []*GitObject{}
+	sendOidList := []string{}
 	for oid := range sendOids {
 		if object, ok := store.Get(oid); ok {
 			send = append(send, object)
+			sendOidList = append(sendOidList, oid)
 		}
 	}
-	return fetchPlan{send: send, shallow: newShallow, unshallow: unshallow, ack: ack, hasAck: hasAck}
+	return fetchPlan{send: send, sendOids: sendOidList, shallow: newShallow, unshallow: unshallow, ack: ack, hasAck: hasAck}
 }
 
 // ---------------------------------------------------------------------------
@@ -524,7 +584,7 @@ func handleFetchV2(repo *RepoRec, groups [][][]byte) *Reply {
 		out.Write(pktFlush)
 	}
 	out.Write(pktLineText("packfile\n"))
-	out.Write(sidebandPackets(writePack(plan.send)))
+	out.Write(sidebandPackets(packForSend(plan.sendOids, plan.send)))
 	out.Write(pktFlush)
 	return &Reply{Status: 200, ContentType: "application/x-git-upload-pack-result", Body: out.Bytes(), Headers: map[string]string{}}
 }
@@ -547,7 +607,7 @@ func handleFetchV0(repo *RepoRec, groups [][][]byte) *Reply {
 	} else {
 		out.Write(pktLineText("NAK\n"))
 	}
-	out.Write(sidebandPackets(writePack(plan.send)))
+	out.Write(sidebandPackets(packForSend(plan.sendOids, plan.send)))
 	out.Write(pktFlush)
 	return &Reply{Status: 200, ContentType: "application/x-git-upload-pack-result", Body: out.Bytes(), Headers: map[string]string{}}
 }

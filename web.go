@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // ReqCtx is one request, fully read.
@@ -37,6 +38,8 @@ type Reply struct {
 	ContentType string
 	Body        []byte
 	Headers     map[string]string
+
+	poolBuf *bytes.Buffer // set when Body aliases a pooled marshal buffer
 }
 
 // ---------------------------------------------------------------------------
@@ -220,13 +223,28 @@ func marshalJSON(value any) []byte {
 	return buf.Bytes()
 }
 
+// Marshal buffers are pooled for whole replies: JsonReply renders into a
+// pooled buffer and writeReply returns it to the pool once the body has
+// been written out, so the hot read/write paths stop re-growing a fresh
+// buffer (and its backing arrays) for every response.
+var jsonBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+func marshalJSONPooled(value any) ([]byte, *bytes.Buffer) {
+	buf := jsonBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	writeJSONValue(buf, value)
+	return buf.Bytes(), buf
+}
+
 // JsonReply is a JSON reply with an initialized (empty) header map.
 func JsonReply(status int, value any) *Reply {
+	body, buf := marshalJSONPooled(value)
 	return &Reply{
 		Status:      status,
 		ContentType: "application/json; charset=utf-8",
-		Body:        marshalJSON(value),
+		Body:        body,
 		Headers:     map[string]string{},
+		poolBuf:     buf,
 	}
 }
 
@@ -246,11 +264,10 @@ func (ctx *ReqCtx) bodyJSON() (any, bool) {
 		return ctx.bodyValue, ctx.bodyMalformed
 	}
 	ctx.bodyParsed = true
-	text := strings.TrimSpace(string(ctx.Body))
-	if text == "" {
+	if len(bytes.TrimSpace(ctx.Body)) == 0 {
 		return nil, false
 	}
-	decoder := json.NewDecoder(strings.NewReader(text))
+	decoder := json.NewDecoder(bytes.NewReader(ctx.Body))
 	decoder.UseNumber()
 	var value any
 	if err := decoder.Decode(&value); err != nil {

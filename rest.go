@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
 	"regexp"
@@ -135,6 +136,137 @@ func labelJson(ctx *ReqCtx, repo *RepoRec, name string) *JObj {
 		Set("color", color).
 		Set("default", false).
 		Set("description", description)
+}
+
+// ---------------------------------------------------------------------------
+// direct issue serialization (hot path)
+
+// writeUserJSON renders exactly what marshalJSON(userJson(ctx)) renders.
+func writeUserJSON(buf *bytes.Buffer, ctx *ReqCtx) {
+	buf.WriteString(`{"login":`)
+	writeJSONString(buf, VIEWER.Login)
+	buf.WriteString(`,"id":`)
+	buf.WriteString(strconv.Itoa(VIEWER.ID))
+	buf.WriteString(`,"node_id":`)
+	writeJSONString(buf, nodeId("04:User", VIEWER.ID))
+	buf.WriteString(`,"avatar_url":"","gravatar_id":"","url":`)
+	writeJSONString(buf, ctx.Origin+apiRoot+"/users/"+VIEWER.Login)
+	buf.WriteString(`,"html_url":`)
+	writeJSONString(buf, ctx.Origin+"/"+VIEWER.Login)
+	buf.WriteString(`,"type":`)
+	writeJSONString(buf, VIEWER.Type)
+	buf.WriteString(`,"site_admin":false}`)
+}
+
+// writeLabelJSON renders exactly what marshalJSON(labelJson(ctx, repo,
+// name)) renders.
+func writeLabelJSON(buf *bytes.Buffer, ctx *ReqCtx, repo *RepoRec, name string) {
+	label, hasLabel := repo.Labels.Get(name)
+	hash := int32(7)
+	for _, ch := range name {
+		unit := ch
+		if ch > 0xFFFF {
+			unit = 0xD800 + ((ch - 0x10000) >> 10)
+		}
+		hash = hash*31 + unit
+	}
+	id := int64(hash)
+	if id < 0 {
+		id = -id
+	}
+	color := "ededed"
+	var description *string
+	if hasLabel {
+		color = label.Color
+		description = label.Description
+	}
+	buf.WriteString(`{"id":`)
+	buf.WriteString(strconv.FormatInt(id, 10))
+	buf.WriteString(`,"node_id":`)
+	writeJSONString(buf, nodeId("05:Label", repo.ID*1000+utf16Len(name)))
+	buf.WriteString(`,"url":`)
+	writeJSONString(buf, fmt.Sprintf("%s%s/repos/%s/%s/labels/%s", ctx.Origin, apiRoot, repo.Owner, repo.Name, encodeURIComponent(name)))
+	buf.WriteString(`,"name":`)
+	writeJSONString(buf, name)
+	buf.WriteString(`,"color":`)
+	writeJSONString(buf, color)
+	buf.WriteString(`,"default":false,"description":`)
+	if description == nil {
+		buf.WriteString("null")
+	} else {
+		writeJSONString(buf, *description)
+	}
+	buf.WriteByte('}')
+}
+
+// writeIssueJSON renders exactly what marshalJSON(issueJson(ctx, repo,
+// issue)) renders, field for field in the same order, without building
+// the intermediate JObj tree — the read/write benchmark paths serve this
+// shape thousands of times.
+func writeIssueJSON(buf *bytes.Buffer, ctx *ReqCtx, repo *RepoRec, issue *IssueRec) {
+	base := ctx.Origin + apiRoot + "/repos/" + repo.Owner + "/" + repo.Name
+	num := strconv.Itoa(issue.Number)
+	buf.WriteString(`{"id":`)
+	buf.WriteString(strconv.Itoa(issue.ID))
+	buf.WriteString(`,"node_id":`)
+	writeJSONString(buf, nodeId("05:Issue", issue.ID))
+	buf.WriteString(`,"url":`)
+	writeJSONString(buf, base+"/issues/"+num)
+	buf.WriteString(`,"repository_url":`)
+	writeJSONString(buf, base)
+	buf.WriteString(`,"labels_url":`)
+	writeJSONString(buf, base+"/issues/"+num+"/labels{/name}")
+	buf.WriteString(`,"comments_url":`)
+	writeJSONString(buf, base+"/issues/"+num+"/comments")
+	buf.WriteString(`,"events_url":`)
+	writeJSONString(buf, base+"/issues/"+num+"/events")
+	buf.WriteString(`,"html_url":`)
+	writeJSONString(buf, ctx.Origin+"/"+repo.Owner+"/"+repo.Name+"/issues/"+num)
+	buf.WriteString(`,"number":`)
+	buf.WriteString(num)
+	buf.WriteString(`,"state":`)
+	writeJSONString(buf, issue.State)
+	buf.WriteString(`,"title":`)
+	writeJSONString(buf, issue.Title)
+	buf.WriteString(`,"body":`)
+	writeJSONString(buf, issue.Body)
+	buf.WriteString(`,"user":`)
+	writeUserJSON(buf, ctx)
+	buf.WriteString(`,"labels":[`)
+	for i, name := range issue.Labels {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		writeLabelJSON(buf, ctx, repo, name)
+	}
+	buf.WriteString(`],"assignee":null,"assignees":[],"locked":false,"comments":`)
+	buf.WriteString(strconv.Itoa(len(issue.Comments)))
+	buf.WriteString(`,"closed_at":`)
+	if issue.State == "closed" {
+		writeJSONString(buf, iso(issue.UpdatedEpoch))
+	} else {
+		buf.WriteString("null")
+	}
+	buf.WriteString(`,"created_at":`)
+	writeJSONString(buf, iso(issue.CreatedEpoch))
+	buf.WriteString(`,"updated_at":`)
+	writeJSONString(buf, iso(issue.UpdatedEpoch))
+	buf.WriteByte('}')
+}
+
+// issueReply is JsonReply for a single issue, rendered directly into a
+// pooled buffer.
+func issueReply(ctx *ReqCtx, status int, repo *RepoRec, issue *IssueRec) *Reply {
+	buf := jsonBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	writeIssueJSON(buf, ctx, repo, issue)
+	return &Reply{
+		Status:      status,
+		ContentType: "application/json; charset=utf-8",
+		Body:        buf.Bytes(),
+		Headers:     map[string]string{},
+		poolBuf:     buf,
+	}
 }
 
 func issueJson(ctx *ReqCtx, repo *RepoRec, issue *IssueRec) *JObj {
@@ -1192,13 +1324,13 @@ func routeIssues(ctx *ReqCtx, repo *RepoRec, rest []string) *Reply {
 			}
 			repo.NextNumber++
 			repo.Issues[issue.Number] = issue
-			return JsonReply(201, issueJson(ctx, repo, issue))
+			return issueReply(ctx, 201, repo, issue)
 		}
 		panic(NotFound())
 	}
 	if len(rest) == 2 {
 		if method == "GET" {
-			return JsonReply(200, issueJson(ctx, repo, requireIssue(repo, rest[1])))
+			return issueReply(ctx, 200, repo, requireIssue(repo, rest[1]))
 		}
 		if method == "PATCH" {
 			issue := requireIssue(repo, rest[1])
@@ -1227,7 +1359,7 @@ func routeIssues(ctx *ReqCtx, repo *RepoRec, rest []string) *Reply {
 				}
 			}
 			issue.UpdatedEpoch = tickEpochSec()
-			return JsonReply(200, issueJson(ctx, repo, issue))
+			return issueReply(ctx, 200, repo, issue)
 		}
 		panic(NotFound())
 	}

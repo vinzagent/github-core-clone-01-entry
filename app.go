@@ -7,6 +7,7 @@ package main
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,19 +46,11 @@ var requestCounter atomic.Int64
 
 func nextRequestId() string {
 	counter := requestCounter.Add(1)
-	return fmt.Sprintf("vinz-%s-%x", toBase36(counter), (counter*2654435761)%0xffffffff)
-}
-
-func toBase36(value int64) string {
-	if value == 0 {
-		return "0"
-	}
-	const digits = "0123456789abcdefghijklmnopqrstuvwxyz"
-	out := []byte{}
-	for value > 0 {
-		out = append([]byte{digits[value%36]}, out...)
-		value /= 36
-	}
+	var buf [48]byte
+	out := append(buf[:0], "vinz-"...)
+	out = strconv.AppendInt(out, counter, 36)
+	out = append(out, '-')
+	out = strconv.AppendUint(out, uint64((counter*2654435761)%0xffffffff), 16)
 	return string(out)
 }
 
@@ -69,6 +62,11 @@ func isMutation(ctx *ReqCtx) bool {
 	}
 	if strings.Contains(ctx.Path, "git-receive-pack") {
 		return true
+	}
+	if strings.Contains(ctx.Path, "git-upload-pack") {
+		// Fetch and ls-refs only read the store (objects are immutable
+		// once stored), so they run under the read lock and parallelise.
+		return false
 	}
 	switch ctx.Method {
 	case "POST", "PUT", "PATCH", "DELETE":

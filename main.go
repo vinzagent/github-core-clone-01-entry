@@ -39,6 +39,11 @@ func writeReply(w http.ResponseWriter, reply *Reply) {
 	if len(reply.Body) > 0 {
 		_, _ = w.Write(reply.Body)
 	}
+	if reply.poolBuf != nil {
+		reply.poolBuf.Reset()
+		jsonBufPool.Put(reply.poolBuf)
+		reply.poolBuf = nil
+	}
 }
 
 func writeInternalError(w http.ResponseWriter) {
@@ -73,17 +78,21 @@ func serveHTTP(expectedToken string) http.HandlerFunc {
 		if host == "" {
 			host = "localhost"
 		}
-		headers := make(map[string]string, len(r.Header))
-		for key, values := range r.Header {
-			if len(values) > 0 {
-				headers[strings.ToLower(key)] = values[0]
-			}
+		// The surfaces read exactly one request header (git-protocol,
+		// in HandleGit); Authorization is checked separately below.
+		headers := map[string]string{}
+		if protocol := r.Header.Get("Git-Protocol"); protocol != "" {
+			headers["git-protocol"] = protocol
 		}
 		authorization := r.Header.Get("Authorization")
+		var query url.Values
+		if r.URL.RawQuery != "" {
+			query = r.URL.Query()
+		}
 		ctx := &ReqCtx{
 			Method:     r.Method,
 			Path:       decodePath(r.URL.EscapedPath()),
-			Query:      r.URL.Query(),
+			Query:      query,
 			Origin:     "http://" + host,
 			Headers:    headers,
 			Body:       body,
